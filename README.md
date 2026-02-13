@@ -1,6 +1,3 @@
-下面是为该项目设计的完整商业级 README 文档（可直接复制为 `README.md` 使用）。
-
----
 
 # Go Microservice Template
 
