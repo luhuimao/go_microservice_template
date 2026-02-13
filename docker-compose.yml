@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: test
+    ports:
+      - "3306:3306"
+
+  app:
+    build: .
+    depends_on:
+      - mysql
+    ports:
+      - "8080:8080"
