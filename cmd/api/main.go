@@ -8,9 +8,11 @@ import (
 	"syscall"
 	"time"
 
-	"internal/config"
+	"github.com/luhuimao/microservice_mvp_demo/internal/config"
 
 	"github.com/gin-gonic/gin"
+	"github.com/luhuimao/microservice_mvp_demo/internal/cache"
+	pkgcache "github.com/luhuimao/microservice_mvp_demo/internal/pkg/cache"
 	"github.com/luhuimao/microservice_mvp_demo/internal/pkg/database"
 	"github.com/luhuimao/microservice_mvp_demo/internal/pkg/logger"
 	"github.com/luhuimao/microservice_mvp_demo/internal/repository"
@@ -22,10 +24,16 @@ func main() {
 	cfg := config.Load()
 	log := logger.New()
 
+	// 数据库
 	db := database.NewMySQL(cfg)
 
+	// Redis 缓存
+	rdb := pkgcache.NewRedisClient(cfg)
+	userCache := cache.NewUserCache(rdb)
+
+	// 依赖注入
 	userRepo := repository.NewUserRepository(db)
-	userService := service.NewUserService(userRepo)
+	userService := service.NewUserService(userRepo, userCache)
 
 	r := gin.Default()
 	httpTransport.RegisterRoutes(r, userService)

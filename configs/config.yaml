@@ -3,3 +3,8 @@ server:
 
 mysql:
   dsn: "root:password@tcp(mysql:3306)/test?charset=utf8mb4&parseTime=True&loc=Local"
+
+redis:
+  addr: "redis:6379"
+  password: ""
+  db: 0

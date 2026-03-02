@@ -9,6 +9,11 @@ type Config struct {
 	MySQL struct {
 		DSN string
 	}
+	Redis struct {
+		Addr     string
+		Password string
+		DB       int
+	}
 }
 
 func Load() *Config {
