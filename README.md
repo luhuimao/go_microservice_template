@@ -12,7 +12,7 @@
 * 优雅关闭（Graceful Shutdown）
 * 单元测试（testify + miniredis）
 
-📄 **模块文档**：[Redis 缓存模块详细设计](docs/redis-cache.md)
+📄 **模块文档**：[Redis 缓存模块详细设计](docs/redis-cache.md) · [MySQL 调优指南](docs/mysql-tuning.md)
 
 ---
 
