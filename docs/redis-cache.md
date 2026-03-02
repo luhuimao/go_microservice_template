@@ -17,6 +17,7 @@
 8. [初始化与依赖注入](#8-初始化与依赖注入)
 9. [单元测试](#9-单元测试)
 10. [扩展指南](#10-扩展指南)
+11. [性能调优](#11-性能调优)
 
 ---
 
@@ -304,3 +305,243 @@ func (c *localLRUCache) Del(...) error { /* ... */ }
 | 多级缓存 | 本地内存（L1）+ Redis（L2）+ DB（L3） |
 | 监控指标 | 统计缓存命中率，接入 Prometheus |
 | 批量操作 | 使用 `MGET` / Pipeline 减少网络 RTT |
+
+---
+
+## 11. 性能调优
+
+> **优先级建议**：连接池配置 → TTL 抖动 → Singleflight → 服务端 maxmemory 策略。前两项改动最小、收益最大，建议优先落地。
+
+### 11.1 连接池调优
+
+当前 `NewRedisClient` 使用全默认连接池参数，生产环境必须显式配置：
+
+```go
+// internal/pkg/cache/redis.go
+rdb := redis.NewClient(&redis.Options{
+    Addr:     cfg.Redis.Addr,
+    Password: cfg.Redis.Password,
+    DB:       cfg.Redis.DB,
+
+    // ── 连接池 ──────────────────────────────────────
+    PoolSize:     10,               // 最大连接数（建议 = CPU 核心数 × 2~4）
+    MinIdleConns: 3,                // 最小空闲连接，避免冷启动延迟
+    MaxIdleConns: 5,                // 最大空闲连接
+
+    // ── 超时 ────────────────────────────────────────
+    DialTimeout:  3 * time.Second,
+    ReadTimeout:  500 * time.Millisecond,
+    WriteTimeout: 500 * time.Millisecond,
+    PoolTimeout:  1 * time.Second,  // 等待空闲连接的超时
+
+    // ── 重试 ────────────────────────────────────────
+    MaxRetries:      3,
+    MinRetryBackoff: 8 * time.Millisecond,
+    MaxRetryBackoff: 512 * time.Millisecond,
+})
+```
+
+同时在 `internal/config/config.go` 中扩充配置结构体以支持外部配置：
+
+```go
+Redis struct {
+    Addr            string
+    Password        string
+    DB              int
+    PoolSize        int
+    MinIdleConns    int
+    DialTimeoutSec  int
+    ReadTimeoutMs   int
+    WriteTimeoutMs  int
+}
+```
+
+---
+
+### 11.2 TTL 随机抖动（防雪崩）
+
+**问题**：大量 key 使用固定 TTL，会在同一时刻集中过期，导致 DB 瞬间压力激增（缓存雪崩）。
+
+**方案**：在基础 TTL 上叠加随机抖动：
+
+```go
+// internal/cache/user_cache.go
+import "math/rand"
+
+const (
+    baseTTL   = 5 * time.Minute
+    jitterMax = 60 // 秒，抖动范围
+)
+
+func jitteredTTL() time.Duration {
+    jitter := time.Duration(rand.Intn(jitterMax)) * time.Second
+    return baseTTL + jitter  // 实际 TTL：5min ~ 6min 随机
+}
+
+func (c *userRedisCache) Set(ctx context.Context, id uint, user *domain.User, ttl time.Duration) error {
+    if ttl == 0 {
+        ttl = jitteredTTL() // 替换原固定 TTL
+    }
+    // ...
+}
+```
+
+---
+
+### 11.3 缓存穿透防护
+
+**问题**：大量请求查询不存在的 ID（如爬虫攻击），每次均穿透到 DB。
+
+**方案 A：缓存空值**
+
+```go
+// service 层 Get 方法中
+user, err := s.repo.FindByID(id)
+if err != nil {
+    if isNotFoundError(err) {
+        // 缓存空标记，短 TTL 防止穿透
+        _ = s.cache.Set(ctx, id, &domain.User{ID: 0}, 1*time.Minute)
+    }
+    return nil, err
+}
+// Get 时识别空标记
+if user.ID == 0 {
+    return nil, ErrNotFound
+}
+```
+
+**方案 B：布隆过滤器**（适合 ID 范围已知的场景）
+
+```go
+import "github.com/bits-and-blooms/bloom/v3"
+
+// 启动时预热已存在的 ID 集合
+filter := bloom.NewWithEstimates(1_000_000, 0.01)
+filter.Add([]byte("1"))
+// ...
+
+// 查询前预判
+if !filter.Test([]byte(fmt.Sprintf("%d", id))) {
+    return nil, ErrNotFound // 直接拒绝，不查缓存也不查 DB
+}
+```
+
+---
+
+### 11.4 缓存击穿防护（Singleflight）
+
+**问题**：热点 key 过期瞬间，大量并发请求同时回源 DB。
+
+**方案**：使用 `singleflight` 合并并发请求，只允许一个请求穿透到 DB：
+
+```go
+import "golang.org/x/sync/singleflight"
+
+type userService struct {
+    repo  repository.UserRepository
+    cache cache.UserCache
+    sfg   singleflight.Group // 新增
+}
+
+func (s *userService) Get(id uint) (*domain.User, error) {
+    ctx := context.Background()
+
+    // 先查缓存
+    if s.cache != nil {
+        if user, err := s.cache.Get(ctx, id); err == nil {
+            return user, nil
+        }
+    }
+
+    // singleflight：相同 id 的并发请求共享一次 DB 查询
+    key := fmt.Sprintf("user:%d", id)
+    v, err, _ := s.sfg.Do(key, func() (interface{}, error) {
+        user, err := s.repo.FindByID(id)
+        if err != nil {
+            return nil, err
+        }
+        _ = s.cache.Set(ctx, id, user, 0)
+        return user, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    return v.(*domain.User), nil
+}
+```
+
+---
+
+### 11.5 序列化方案选型
+
+| 方案 | 相对性能 | 特点 | 推荐场景 |
+|------|----------|------|----------|
+| `encoding/json`（当前）| 基准 | 标准库，无依赖 | 开发/低流量 |
+| `github.com/bytedance/sonic` | ~5-10x 更快 | 零拷贝，兼容 `encoding/json` | 高 QPS 服务 |
+| `github.com/vmihailenco/msgpack` | ~3x 更快，体积小 30% | 二进制格式 | 存储空间敏感 |
+| `google.golang.org/protobuf` | 最快，类型安全 | 需 proto 定义 | 已有 proto 的项目 |
+
+切换 `sonic` 示例（接口兼容，无需修改调用方）：
+
+```go
+import "github.com/bytedance/sonic"
+
+// 替换 json.Marshal / json.Unmarshal
+data, err := sonic.Marshal(user)
+err = sonic.Unmarshal(val, &user)
+```
+
+---
+
+### 11.6 Redis 服务端配置
+
+在 `docker-compose.yml` 中为 Redis 添加关键参数：
+
+```yaml
+redis:
+  image: redis:7-alpine
+  command: >
+    redis-server
+    --maxmemory 256mb
+    --maxmemory-policy allkeys-lru
+    --save ""
+    --appendonly no
+  ports:
+    - "6379:6379"
+```
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| `maxmemory` | 物理内存的 50~70% | 防止 OOM |
+| `maxmemory-policy` | `allkeys-lru` | 驱逐最久未使用的 key（缓存场景最优） |
+| `save ""` | — | 纯缓存场景关闭 RDB 持久化，降低 I/O |
+| `appendonly no` | — | 关闭 AOF，减少写放大 |
+
+---
+
+### 11.7 监控指标
+
+生产环境必须监控以下指标，接入 Prometheus：
+
+```go
+// 使用 go-redis 官方 Prometheus Hook
+import "github.com/redis/go-redis/extra/redisprometheus/v9"
+
+rdb.AddHook(redisprometheus.NewHook(
+    redisprometheus.WithInstanceName("user_service"),
+))
+```
+
+| 指标 | 告警阈值参考 |
+|------|-------------|
+| 缓存命中率（`keyspace_hits / (hits+misses)`） | < 80% 需排查 |
+| 连接池等待次数（`pool_stats.Waits`） | > 0 需扩充 `PoolSize` |
+| 命令延迟 P99 | > 10ms 需优化网络或序列化 |
+| 内存使用率 | > 80% `maxmemory` 需扩容 |
+
+Redis CLI 快速查看：
+
+```bash
+redis-cli INFO stats | grep keyspace
+redis-cli INFO memory | grep used_memory_human
+```
